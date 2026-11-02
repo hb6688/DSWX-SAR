@@ -126,7 +126,7 @@ def run(cfg):
     legacy_mask_path = os.path.join(
         scratch_dir, f'{mosaic_prefix}_mask_{pol_all_str}.tif')
     exception_mask_path = os.path.join(
-        scratch_dir, f'{mosaic_prefix}_mask_input_exception.{pol_all_str}.tif')
+        scratch_dir, f'{mosaic_prefix}_mask_input_exception_{pol_all_str}.tif')
     legacy_exists = os.path.isfile(legacy_mask_path)
     exception_exists = os.path.isfile(exception_mask_path)
     if legacy_exists == exception_exists:
@@ -136,7 +136,7 @@ def run(cfg):
             f'exception={exception_exists}. Remove stale mask mosaics and rerun.')
     mask_source = 'exception' if exception_exists else 'legacy'
     mask_path = exception_mask_path if exception_exists else legacy_mask_path
-    expected_dtype = 'uint16' if exception_exists else 'uint8'
+    expected_dtype = 'uint8'
     logger.info('Using %s GCOV mask: %s', mask_source, mask_path)
 
     with rasterio.open(ref_filename) as science_ds, \
@@ -249,7 +249,6 @@ def run(cfg):
             bp, pol_list, scratch_dir, mosaic_prefix,
             filter_flag, filter_method, filter_options,
             co_pol, cross_pol, mask_path, mask_flag=True,
-            mask_source=mask_source,
         ) for bp in block_params
     )
 
@@ -325,8 +324,7 @@ def _filter_one_block(block_param,
                       co_pol,
                       cross_pol,
                       mask_path = None,
-                      mask_flag = False,
-                      mask_source = 'legacy'):
+                      mask_flag = False):
     """
     Return (block_param, stacked_float32_array) for a single block.
 
@@ -355,10 +353,7 @@ def _filter_one_block(block_param,
             arr = _dswx_sar_util.get_raster_block(
                 intensity_path, block_param)
         if mask_block is not None:
-            if mask_source == 'exception':
-                arr[mask_block != 0] = np.nan
-            else:
-                arr[(mask_block == 0) | (mask_block == 255)] = np.nan
+            arr[mask_block != 1] = np.nan
         arr[arr == 0] = np.nan         # mask padded zeros
         real_pol_data[pol] = arr.astype(np.float32)
 

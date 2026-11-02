@@ -40,43 +40,38 @@ import psutil
 logger = logging.getLogger('dswx_sar')
 
 # Polarization exception flags in NISAR GCOV inputDataExceptionMask.
-GCOV_POL_EXCEPTION_BITS = {
+gcov_pol_exception_bits = {
     'HH': 1 << 8, 'HV': 1 << 9, 'VH': 1 << 10, 'VV': 1 << 11,
     'LH': 1 << 12, 'LV': 1 << 13, 'RH': 1 << 14, 'RV': 1 << 15,
 }
-GCOV_ALL_POL_EXCEPTION_BITS = sum(GCOV_POL_EXCEPTION_BITS.values())
+gcov_all_pol_exception_bits = sum(gcov_pol_exception_bits.values())
 
 
 def gcov_exception_to_valid_mask(values, polarizations):
-    """Convert uint16 exception flags to uint8: 1=valid, 0=invalid.
+    """Decode uint16 GCOV mask into binary uint8 (1=valid, 0=invalid).
 
-    Raise ValueError on unexpected polarization flags. 65535 is fill.
-    Non-polarization exception bits are retained as quality exceptions:
-    any nonzero exception makes a pixel invalid.
+    All requested polarization fully-focused bits must be set. Any low-byte
+    input-data exception code invalidates the pixel. 65535 is fill/invalid.
+    Unexpected polarization bits are not checked: format selection uses
+    metadata only, as requested.
     """
     values = np.asarray(values)
     if values.dtype != np.dtype('uint16'):
         raise ValueError(f'Expected uint16 exception mask, got {values.dtype}')
-    expected = 0
+    required = 0
     for pol in polarizations:
-        if pol not in GCOV_POL_EXCEPTION_BITS:
+        if pol not in gcov_pol_exception_bits:
             raise ValueError(f'Unsupported GCOV polarization: {pol}')
-        expected |= GCOV_POL_EXCEPTION_BITS[pol]
-    unexpected = GCOV_ALL_POL_EXCEPTION_BITS & ~expected
-    mismatch = ((values & unexpected) != 0) & (values != 65535)
-    if np.any(mismatch):
-        bad = np.unique(values[mismatch])[:16].tolist()
-        raise ValueError(
-            f'inputDataExceptionMask has polarization bits outside '
-            f'{list(polarizations)}: sample values {bad}'
-        )
-    return (values == 0).astype(np.uint8)
+        required |= gcov_pol_exception_bits[pol]
+    valid = ((values & required) == required)
+    valid &= ((values & np.uint16(0x00FF)) == 0)
+    valid &= (values != 65535)
+    return valid.astype(np.uint8)
 
 
-def gcov_old_to_valid_mask(values):
-    """Convert GCOV subswath mask to 1=valid, 0=invalid, 255=NoData."""
-    return np.where(values == 255, 255, values != 0).astype(np.uint8)
-
+def gcov_legacy_to_valid_mask(values):
+    """Decode legacy subswath mask: 1..254 valid; 0 and 255 invalid."""
+    return ((values != 0) & (values != 255)).astype(np.uint8)
 
 
 
@@ -602,7 +597,7 @@ class RTCReader(DataReader):
                     out_rows=num_rows,
                     out_cols=num_cols,
                     align_to_chunks=True,
-                    K_chunks=8,
+                    k_chunks=8,
                 )
 
                 # Reproject layover and shadow mask to target EPSG if needed
@@ -812,7 +807,7 @@ class RTCReader(DataReader):
                             out_rows=out_rows,
                             out_cols=out_cols,
                             align_to_chunks=True,
-                            K_chunks=8,
+                            k_chunks=8,
                         )
 
                     output_gtiff_list.append(output_gtiff)
@@ -851,7 +846,7 @@ class RTCReader(DataReader):
 
         # ---- Selected original GCOV mask, by input and frequency ----
         # Exception mask takes precedence; legacy mask is the fallback.
-        # Preserve native uint16 exception flags or uint8 legacy values.
+        # Decode each selected frame mask to binary uint8 before mosaicking.
         for input_idx, input_rtc in enumerate(input_list):
             output_prefix = self.extract_file_name(input_rtc)
             ds_epsg = int(epsg_array[input_idx])
@@ -920,7 +915,7 @@ class RTCReader(DataReader):
                     if previous_source != source:
                         raise ValueError(
                             f'Mixed legacy/exception mask sources for {pol_key} across frames. '
-                            'Cannot preserve a single native-type mosaic; process these separately.'
+                            'Cannot label a single mosaic as both legacy and exception; process these separately.'
                         )
                     if any(f[path].shape != dset.shape for path in science_paths):
                         raise ValueError(f'Mask/science shape mismatch: {input_rtc} frequency{freq_group}')
@@ -932,19 +927,19 @@ class RTCReader(DataReader):
                     r0, r1, c0, c1 = win
                     mask_suffix = ('mask_input_exception' if source == 'exception'
                                    else 'mask')
+                    
                     output_mask_gtiff = (
-                        f'{scratch_dir}/{output_prefix}_{mask_suffix}_{pol_key}_{freq_group}.tif'
-                        if source == 'exception' else
-                        f'{scratch_dir}/{output_prefix}_mask_{freq_group}.tif')
-                    mask_dtype = 'uint16' if source == 'exception' else 'uint8'
-                    mask_nodata = 65535 if source == 'exception' else 255
+                        f'{scratch_dir}/{output_prefix}_{mask_suffix}_{pol_key}_{freq_group}.tif')
+
+                    mask_dtype = 'uint8'
+                    mask_nodata = 0
                     self.read_write_rtc_h5py(
                         dset, output_mask_gtiff, num_rows, num_cols,
                         self.row_blk_size, self.col_blk_size,
                         gdal_cache_max_mb, np.float32(mask_nodata),
                         geotransform, crs, {}, is_mask=True, out_dtype=mask_dtype,
                         row0=r0, col0=c0, out_rows=r1-r0, out_cols=c1-c0,
-                        align_to_chunks=True, K_chunks=8,
+                        align_to_chunks=True, k_chunks=8,
                         mask_source=source, mask_polarizations=pols_sorted,
                     )
                     if ds_epsg != most_freq_epsg:
@@ -954,9 +949,9 @@ class RTCReader(DataReader):
                             options=gdal.WarpOptions(
                                 format='GTiff', dstSRS=f'EPSG:{most_freq_epsg}',
                                 resampleAlg='near',
-                                outputType=(gdal.GDT_UInt16 if source == 'exception'
-                                            else gdal.GDT_Byte),
-                                srcNodata=mask_nodata, dstNodata=mask_nodata,
+                                outputType=gdal.GDT_Byte,
+                                srcNodata=mask_nodata,
+                                dstNodata=mask_nodata,
                                 creationOptions=['TILED=YES', 'COMPRESS=DEFLATE'],
                             ),
                         )
@@ -1024,7 +1019,7 @@ class RTCReader(DataReader):
             out_cols: int | None = None,
             # NEW: optionally align row reads to HDF5 chunk rows for speed
             align_to_chunks: bool = True,
-            K_chunks: int = 8,
+            k_chunks: int = 8,
             mask_source: str | None = None,
             mask_polarizations=None,
         ):
@@ -1076,7 +1071,7 @@ class RTCReader(DataReader):
                 'interleave': 'band',
             }
             if is_mask:
-                profile["nodata"] = 65535 if out_dtype == "uint16" else 255
+                profile['nodata'] = 0 if mask_source in ('legacy', 'exception') else 255
 
             # Helpers for aligned row reading
             def aligned_ranges(start_row: int, stop_row: int, blk: int, align: int):
@@ -1095,7 +1090,7 @@ class RTCReader(DataReader):
             chunk_rows = int(chunk[0]) if chunk and len(chunk) >= 2 else 512
 
             if align_to_chunks and chunk_rows > 0:
-                row_blk_size_eff = int(K_chunks) * chunk_rows
+                row_blk_size_eff = int(k_chunks) * chunk_rows
                 align = chunk_rows
             else:
                 row_blk_size_eff = int(row_blk_size)
@@ -1116,29 +1111,16 @@ class RTCReader(DataReader):
                             # Read from HDF5 window (source coords)
                             ds_blk = h5_dset[rs:re, col0 : col0 + out_cols]
 
-                            # Validate exception polarization flags in the block
-                            # already read for GeoTIFF writing (no extra HDF5 I/O).
+                            # Decode the selected GCOV mask per frame while reading.
                             if is_mask:
                                 if mask_source == 'exception':
-                                    expected_bits = 0
-                                    for pol in mask_polarizations:
-                                        expected_bits |= GCOV_POL_EXCEPTION_BITS[pol]
-                                    unexpected_bits = (
-                                        GCOV_ALL_POL_EXCEPTION_BITS & ~expected_bits
-                                    )
-                                    invalid = (
-                                        ((ds_blk & unexpected_bits) != 0)
-                                        & (ds_blk != 65535)
-                                    )
-                                    if np.any(invalid):
-                                        bad = np.unique(ds_blk[invalid])[:16].tolist()
-                                        raise ValueError(
-                                            f'Invalid polarization bits in inputDataExceptionMask '
-                                            f'for {mask_polarizations} at source rows '
-                                            f'{rs}:{re}, columns {col0}:{col0 + out_cols}; '
-                                            f'sample values={bad}'
-                                        )
-                                blk = ds_blk.astype(dst_dtype, copy=False)
+                                    blk = gcov_exception_to_valid_mask(
+                                        ds_blk, mask_polarizations)
+                                elif mask_source == 'legacy':
+                                    blk = gcov_legacy_to_valid_mask(ds_blk)
+                                else:
+                                    # STATIC layover/shadow masks retain their own codes.
+                                    blk = ds_blk.astype(dst_dtype, copy=False)
                             else:
                                 blk = ds_blk.astype(np.float32, copy=False)
                                 blk[np.isinf(blk)] = designated_value
@@ -1226,11 +1208,11 @@ class RTCReader(DataReader):
 
                 source = mask_source_by_pol[mask_pol_key]
                 if source == 'exception':
-                    mosaic_name = f'{mosaic_prefix}_mask_input_exception.{mask_pol_key}.tif'
-                    mask_nodata = 65535
+                    mosaic_name = f'{mosaic_prefix}_mask_input_exception_{mask_pol_key}.tif'
+                    mask_nodata = 0
                 else:
                     mosaic_name = f'{mosaic_prefix}_mask_{mask_pol_key}.tif'
-                    mask_nodata = 255
+                    mask_nodata = 0
                 mask_mosaic_gtiff = f'{scratch_dir}/{mosaic_name}'
 
                 print(
